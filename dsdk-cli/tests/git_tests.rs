@@ -55,7 +55,7 @@ fn test_clone_repository() {
     let fixture = TestFixture::new();
     let clone_path = fixture.path().join("clone");
 
-    let result = git_operations::clone_repo(&source_repo.file_url(), &clone_path, None)
+    let result = git_operations::clone_repo(&source_repo.file_url(), &clone_path, "HEAD", 1)
         .expect("Should clone repository");
 
     assert!(result.is_success());
@@ -64,29 +64,6 @@ fn test_clone_repository() {
         fs::read_to_string(clone_path.join("README.md")).unwrap(),
         "# Test\n"
     );
-}
-
-#[test]
-fn test_clone_with_reference() {
-    let source_repo = MockGitRepo::new("source");
-    source_repo.add_file("data.txt", "content\n");
-    source_repo.commit("Initial commit");
-
-    let fixture = TestFixture::new();
-
-    // Create a mirror clone first
-    let mirror_path = fixture.path().join("mirror");
-    git_operations::clone_repo(&source_repo.file_url(), &mirror_path, None)
-        .expect("Should clone to mirror");
-
-    // Clone with reference to mirror
-    let workspace_path = fixture.path().join("workspace");
-    let result =
-        git_operations::clone_repo(&source_repo.file_url(), &workspace_path, Some(&mirror_path))
-            .expect("Should clone with reference");
-
-    assert!(result.is_success());
-    assert!(workspace_path.join("data.txt").exists());
 }
 
 #[test]
@@ -170,7 +147,7 @@ fn test_fetch_operations() {
     // Clone from upstream
     let fixture = TestFixture::new();
     let clone_path = fixture.path().join("clone");
-    git_operations::clone_repo(&upstream.file_url(), &clone_path, None).expect("Should clone");
+    git_operations::clone_repo(&upstream.file_url(), &clone_path, "HEAD", 1).expect("Should clone");
 
     // Add new commit to working repo
     working.add_file("new.txt", "new content\n");
@@ -310,7 +287,8 @@ fn test_mirror_workflow() {
     let clone_result = git_operations::clone_repo(
         &format!("file://{}", mirror_path.display()),
         &workspace_path,
-        None,
+        "HEAD",
+        1,
     )
     .expect("Should clone from mirror");
     assert!(clone_result.is_success());
@@ -322,22 +300,51 @@ fn test_mirror_workflow() {
 }
 
 #[test]
-fn test_branch_detection() {
+fn test_branch_tag_detection() {
     let repo = MockGitRepo::new("test-repo");
     repo.add_file("test.txt", "test\n");
     repo.commit("Initial commit");
-
-    // Main/master is a branch
-    let is_branch = git_operations::is_branch_reference(&repo.path, "main");
-    let is_branch_master = git_operations::is_branch_reference(&repo.path, "master");
-    assert!(is_branch || is_branch_master);
-
-    // Create and checkout a tag
     repo.create_tag("v1.0.0");
+    git_operations::create_branch(&repo.path, "feature-branch", None)
+        .expect("Should create feature branch");
+    let url = repo.file_url();
 
-    // Tag is not a branch
-    let is_branch = git_operations::is_branch_reference(&repo.path, "v1.0.0");
-    assert!(!is_branch);
+    let refs = git_operations::ls_remote(&url, true, true).expect("ls_remote should succeed");
+
+    // Default branch is detected as a branch
+    let (main_refspec, _, main_sha) = git_operations::resolve_fetch_refspec(&refs, "main");
+    assert!(
+        main_refspec.starts_with("refs/heads/"),
+        "Default branch should be detected as a branch"
+    );
+    assert!(main_sha.is_some());
+
+    // Feature branch is detected as a branch
+    let (fb_refspec, _, fb_sha) = git_operations::resolve_fetch_refspec(&refs, "feature-branch");
+    assert!(
+        fb_refspec.starts_with("refs/heads/"),
+        "feature-branch should be a branch reference, got: {}",
+        fb_refspec
+    );
+    assert!(fb_sha.is_some());
+
+    // Tag is not detected as a branch
+    let (tag_refspec, _, tag_sha) = git_operations::resolve_fetch_refspec(&refs, "v1.0.0");
+    assert!(
+        tag_refspec.starts_with("refs/tags/"),
+        "Tag should be detected as a tag, got: {}",
+        tag_refspec
+    );
+    assert!(tag_sha.is_some());
+
+    // Nonexistent ref falls through as a commit hash (no sha)
+    let (nonexistent_refspec, _, nonexistent_sha) =
+        git_operations::resolve_fetch_refspec(&refs, "nonexistent-branch");
+    assert_eq!(
+        nonexistent_refspec, "nonexistent-branch",
+        "Nonexistent ref should be returned as-is (treated as commit hash)"
+    );
+    assert!(nonexistent_sha.is_none());
 }
 
 #[test]

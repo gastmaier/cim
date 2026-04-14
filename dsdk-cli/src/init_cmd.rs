@@ -15,10 +15,7 @@ use crate::install_cmd::{
     is_container_environment,
 };
 use crate::makefile::generate_makefile_content;
-use crate::update_cmd::{
-    update_mirror_repos, update_workspace_repos_no_mirror_with_result,
-    update_workspace_repos_with_result,
-};
+use crate::update_cmd::{update_mirror_repos, update_workspace_repos_with_result};
 use crate::version::spawn_version_check;
 use dsdk_cli::config::SdkConfigCore;
 use dsdk_cli::download::{copy_yaml_files_to_workspace, process_copy_files};
@@ -1088,7 +1085,7 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         } else {
             messages::info("Skipping mirror operations (no_mirror = true in user config)");
         }
-        update_workspace_repos_no_mirror_with_result(&filtered_config, &workspace_path, true)
+        update_workspace_repos_with_result(&filtered_config, &workspace_path, true, true)
     } else {
         messages::verbose(&format!("Mirror: {}", sdk_config.mirror().display()));
 
@@ -1096,7 +1093,7 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         update_mirror_repos(&filtered_config);
 
         // Update workspace repositories
-        update_workspace_repos_with_result(&filtered_config, &workspace_path, true)
+        update_workspace_repos_with_result(&filtered_config, &workspace_path, true, false)
     };
 
     // Process copy_files after git repositories are cloned
@@ -1431,8 +1428,8 @@ pub(crate) fn list_targets_from_git_repo(git_url: &str) -> Result<Vec<String>, a
 
     let temp_path = temp_dir.path();
 
-    // Perform shallow clone of just the main branch
-    let clone_result = git_operations::clone_repo_shallow(git_url, temp_path, 1)?;
+    // Perform clone
+    let clone_result = git_operations::clone_repo(git_url, temp_path, "HEAD", 1)?;
 
     if !clone_result.is_success() {
         return Err(anyhow::anyhow!("Git clone failed: {}", clone_result.stderr));
@@ -1483,7 +1480,7 @@ pub(crate) fn list_target_versions(
         let mut versions = Vec::new();
         let target_prefix = format!("{}-", target_name);
 
-        for ref_name in refs {
+        for (_, ref_name) in refs {
             // Extract branch/tag name from refs/heads/ or refs/tags/
             let name = if let Some(branch_name) = ref_name.strip_prefix("refs/heads/") {
                 branch_name
@@ -1537,20 +1534,9 @@ pub(crate) fn list_target_versions(
     }
 }
 
-/// Check if a commit reference is a branch (vs tag or commit hash)
-pub(crate) fn is_branch_reference(repo_path: &Path, commit_ref: &str) -> bool {
-    git_operations::is_branch_reference(repo_path, commit_ref)
-}
-
-/// Get the latest commit hash for a branch
-pub(crate) fn get_latest_commit_for_branch(repo_path: &Path, branch_name: &str) -> Option<String> {
-    git_operations::get_latest_commit_for_branch(repo_path, branch_name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsdk_cli::git_operations;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1791,110 +1777,6 @@ gits:
         assert!(targets.contains(&".hidden".to_string())); // Hidden dirs with sdk.yml are included
         assert!(!targets.contains(&"no-config".to_string()));
         assert!(!targets.contains(&"not-a-dir.txt".to_string()));
-    }
-
-    #[test]
-    fn test_is_branch_reference_with_mock_git_repo() {
-        let (_temp_dir, workspace_path) = create_test_workspace();
-
-        // Create a mock git repository structure
-        let repo_path = workspace_path.join("test-repo");
-        fs::create_dir_all(&repo_path).expect("Failed to create repo dir");
-
-        // Initialize a git repo
-        let init_result = git_operations::init_repo(&repo_path, false);
-
-        if init_result.is_err() {
-            // Skip this test if git is not available
-            return;
-        }
-
-        // Configure git user for testing
-        let _ = git_operations::config(&repo_path, "user.email", "test@example.com");
-        let _ = git_operations::config(&repo_path, "user.name", "Test User");
-
-        // Create a test file and commit
-        fs::write(repo_path.join("test.txt"), "test content").expect("Failed to write test file");
-        let _ = git_operations::add_files(&repo_path, &["test.txt"]);
-        let _ = git_operations::commit(&repo_path, "Initial commit");
-
-        // Create a branch
-        let _ = git_operations::create_branch(&repo_path, "feature-branch", None);
-
-        // Create a tag
-        let _ = git_operations::create_tag(&repo_path, "v1.0.0");
-
-        // Test branch detection
-        assert!(
-            is_branch_reference(&repo_path, "main") || is_branch_reference(&repo_path, "master")
-        ); // Default branch
-        assert!(is_branch_reference(&repo_path, "feature-branch")); // Created branch
-        assert!(!is_branch_reference(&repo_path, "v1.0.0")); // Tag should not be detected as branch
-        assert!(!is_branch_reference(&repo_path, "nonexistent")); // Non-existent reference
-    }
-
-    #[test]
-    fn test_get_latest_commit_for_branch_functionality() {
-        let (_temp_dir, workspace_path) = create_test_workspace();
-
-        // Create a mock git repository
-        let repo_path = workspace_path.join("test-repo");
-        fs::create_dir_all(&repo_path).expect("Failed to create repo dir");
-
-        // Initialize git repo
-        let init_result = git_operations::init_repo(&repo_path, false);
-
-        if init_result.is_err() {
-            // Skip this test if git is not available
-            return;
-        }
-
-        // Configure git user
-        let _ = git_operations::config(&repo_path, "user.email", "test@example.com");
-        let _ = git_operations::config(&repo_path, "user.name", "Test User");
-
-        // Create and commit a file
-        fs::write(repo_path.join("test.txt"), "test content").expect("Failed to write test file");
-        let _ = git_operations::add_files(&repo_path, &["test.txt"]);
-        let commit_result = git_operations::commit(&repo_path, "Initial commit");
-
-        if commit_result.is_ok() {
-            // Test getting latest commit
-            let default_branch = if is_branch_reference(&repo_path, "main") {
-                "main"
-            } else {
-                "master"
-            };
-
-            let latest_commit = get_latest_commit_for_branch(&repo_path, default_branch);
-            assert!(latest_commit.is_some());
-
-            if let Some(commit_hash) = latest_commit {
-                // Commit hash should be 40 characters (SHA-1)
-                assert_eq!(commit_hash.len(), 40);
-                // Should be hexadecimal
-                assert!(commit_hash.chars().all(|c| c.is_ascii_hexdigit()));
-            }
-        }
-
-        // Test non-existent branch
-        let non_existent = get_latest_commit_for_branch(&repo_path, "nonexistent-branch");
-        assert!(non_existent.is_none());
-    }
-
-    #[test]
-    fn test_branch_vs_tag_detection_edge_cases() {
-        let (_temp_dir, workspace_path) = create_test_workspace();
-
-        // Test detection with non-git directory
-        assert!(!is_branch_reference(&workspace_path, "main"));
-        assert!(!is_branch_reference(&workspace_path, "v1.0.0"));
-
-        // Test with empty string
-        assert!(!is_branch_reference(&workspace_path, ""));
-
-        // Test get_latest_commit with non-git directory
-        assert!(get_latest_commit_for_branch(&workspace_path, "main").is_none());
     }
 
     #[test]

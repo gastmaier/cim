@@ -11,8 +11,7 @@
 
 use crate::cli::{Cli, DockerCommand};
 use crate::init_cmd::{
-    compile_match_regex, create_filtered_sdk_config, filter_git_configs,
-    get_latest_commit_for_branch, is_branch_reference, list_available_targets,
+    compile_match_regex, create_filtered_sdk_config, filter_git_configs, list_available_targets,
     list_target_versions, list_targets_from_source, resolve_target_config,
 };
 use crate::version::{print_update_notice, spawn_version_check};
@@ -24,11 +23,8 @@ use dsdk_cli::workspace::{
 use dsdk_cli::{config, docker_manager, git_operations, messages};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 use threadpool::ThreadPool;
 
 /// Configuration command options
@@ -439,13 +435,13 @@ pub(crate) fn handle_update_command(
 
     if skip_mirror {
         // Update workspace repositories directly from remote URLs
-        update_workspace_repos_no_mirror(&filtered_config, &workspace_path, false);
+        update_workspace_repos(&filtered_config, &workspace_path, false, true);
     } else {
         // Update mirror repositories in parallel
         update_mirror_repos(&filtered_config);
 
         // Update workspace repositories (single-threaded to avoid conflicts)
-        update_workspace_repos(&filtered_config, &workspace_path, false);
+        update_workspace_repos(&filtered_config, &workspace_path, false, false);
     }
 
     // Print any available update notice after the main work is done
@@ -490,75 +486,61 @@ pub(crate) fn update_mirror_repos<T: config::SdkConfigCore>(sdk_config: &T) {
                 // Update remote URL in case it changed in the config
                 let _ = git_operations::remote_set_url(&repo_mirror_path, "origin", &git_cfg.url);
 
-                let fetch_result = git_operations::fetch_all_with_tags(&repo_mirror_path);
-
-                match fetch_result {
-                    Ok(result) if result.is_success() => {
-                        // If the commit is a branch, update the branch to latest commit
-                        if is_branch_reference(&repo_mirror_path, &git_cfg.commit) {
-                            // Get the latest commit hash for the remote branch
-                            if let Some(latest_commit) =
-                                git_operations::get_latest_commit_for_remote_branch(
-                                    &repo_mirror_path,
-                                    "origin",
-                                    &git_cfg.commit,
-                                )
-                            {
-                                // Update the local branch to point to the latest commit
-                                let update_result = git_operations::update_ref(
-                                    &repo_mirror_path,
-                                    &format!("refs/heads/{}", git_cfg.commit),
-                                    &latest_commit,
-                                );
-
-                                // Return success status of the update
-                                match update_result {
-                                    Ok(up_result) => {
-                                        if up_result.is_success() {
-                                            MirrorOperationResult::Updated
-                                        } else {
-                                            MirrorOperationResult::Failed
-                                        }
-                                    }
-                                    Err(_) => MirrorOperationResult::Failed,
-                                }
-                            } else {
-                                // Failed to get latest commit
-                                MirrorOperationResult::Failed
-                            }
-                        } else {
-                            // Non-branch commit, fetch completed successfully
-                            MirrorOperationResult::Updated
-                        }
+                (|| -> anyhow::Result<MirrorOperationResult> {
+                    let refs = git_operations::ls_remote(&git_cfg.url, true, true)?;
+                    let (fetch_refspec, update_ref_name, _) =
+                        git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+                    if !git_operations::fetch_ref(&repo_mirror_path, "origin", &fetch_refspec, 1)?
+                        .is_success()
+                    {
+                        return Ok(MirrorOperationResult::Failed);
                     }
-                    Ok(_) => MirrorOperationResult::Failed,
-                    Err(_) => MirrorOperationResult::Failed,
-                }
+                    let ur = git_operations::update_ref(
+                        &repo_mirror_path,
+                        &update_ref_name,
+                        "FETCH_HEAD",
+                    )?;
+                    Ok(if ur.is_success() {
+                        MirrorOperationResult::Updated
+                    } else {
+                        MirrorOperationResult::Failed
+                    })
+                })()
+                .unwrap_or(MirrorOperationResult::Failed)
             } else {
-                // Clone new mirror
-                messages::progress(&git_cfg.name, "cloning new repository");
-                let clone_result = git_operations::clone_mirror(&git_cfg.url, &repo_mirror_path);
+                // init mirror repository
+                messages::progress(&git_cfg.name, "initializing new repository");
 
-                match clone_result {
-                    Ok(result) => {
-                        if result.is_success() {
-                            // Ensure all tags are fetched after initial clone
-                            match git_operations::fetch_tags(&repo_mirror_path, Some("origin")) {
-                                Ok(fetch_result) if fetch_result.is_success() => {
-                                    MirrorOperationResult::Cloned
-                                }
-                                _ => {
-                                    // Tag fetch failed, but clone succeeded - still report as cloned
-                                    // since the repository is functional even without all tags
-                                    MirrorOperationResult::Cloned
-                                }
-                            }
-                        } else {
-                            MirrorOperationResult::Failed
-                        }
+                (|| -> anyhow::Result<MirrorOperationResult> {
+                    std::fs::create_dir_all(&repo_mirror_path)?;
+                    if !git_operations::init_repo(&repo_mirror_path, true)?.is_success() {
+                        return Ok(MirrorOperationResult::Failed);
                     }
-                    Err(_) => MirrorOperationResult::Failed,
-                }
+                    if !git_operations::remote_add(&repo_mirror_path, "origin", &git_cfg.url)?
+                        .is_success()
+                    {
+                        return Ok(MirrorOperationResult::Failed);
+                    }
+                    let refs = git_operations::ls_remote(&git_cfg.url, true, true)?;
+                    let (fetch_refspec, update_ref_name, _) =
+                        git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+                    if !git_operations::fetch_ref(&repo_mirror_path, "origin", &fetch_refspec, 1)?
+                        .is_success()
+                    {
+                        return Ok(MirrorOperationResult::Failed);
+                    }
+                    let ur = git_operations::update_ref(
+                        &repo_mirror_path,
+                        &update_ref_name,
+                        "FETCH_HEAD",
+                    )?;
+                    Ok(if ur.is_success() {
+                        MirrorOperationResult::Cloned
+                    } else {
+                        MirrorOperationResult::Failed
+                    })
+                })()
+                .unwrap_or(MirrorOperationResult::Failed)
             };
 
             // Print result immediately
@@ -582,6 +564,7 @@ pub(crate) fn update_workspace_repos<T: config::SdkConfigCore>(
     sdk_config: &T,
     workspace_path: &Path,
     is_init: bool,
+    no_mirror: bool,
 ) {
     let action = if is_init { "Initializing" } else { "Updating" };
     messages::status(&format!("\n{} workspace repositories...", action));
@@ -594,21 +577,24 @@ pub(crate) fn update_workspace_repos<T: config::SdkConfigCore>(
         }
     };
 
+    let mirror_path = (!no_mirror).then(|| sdk_config.mirror().clone());
+
     for tier in &tiers {
         let pool = ThreadPool::new(4);
 
         for git_cfg in tier {
             let git_cfg = git_cfg.clone();
             let workspace_path = workspace_path.to_path_buf();
-            let mirror_path = sdk_config.mirror().clone();
+            let mirror_path = mirror_path.clone();
 
             pool.execute(move || {
+                let mirror_path = mirror_path.as_deref();
                 let repo_workspace_path = workspace_path.join(&git_cfg.name);
 
                 let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo(&git_cfg, &repo_workspace_path, &mirror_path)
+                    handle_existing_workspace_repo(&git_cfg, &repo_workspace_path, mirror_path)
                 } else {
-                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, &mirror_path)
+                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, mirror_path)
                 };
 
                 // Print result immediately
@@ -627,6 +613,7 @@ pub(crate) fn update_workspace_repos_with_result<T: config::SdkConfigCore>(
     sdk_config: &T,
     workspace_path: &Path,
     is_init: bool,
+    no_mirror: bool,
 ) -> bool {
     let action = if is_init { "Initializing" } else { "Updating" };
     messages::status(&format!("\n{} workspace repositories...", action));
@@ -641,122 +628,28 @@ pub(crate) fn update_workspace_repos_with_result<T: config::SdkConfigCore>(
 
     let any_failed = Arc::new(AtomicBool::new(false));
 
+    let mirror_path = (!no_mirror).then(|| sdk_config.mirror().clone());
+
     for tier in &tiers {
         let pool = ThreadPool::new(4);
 
         for git_cfg in tier {
             let git_cfg = git_cfg.clone();
             let workspace_path = workspace_path.to_path_buf();
-            let mirror_path = sdk_config.mirror().clone();
+            let mirror_path = mirror_path.clone();
             let any_failed = Arc::clone(&any_failed);
 
             pool.execute(move || {
                 let repo_workspace_path = workspace_path.join(&git_cfg.name);
 
                 let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo(&git_cfg, &repo_workspace_path, &mirror_path)
+                    handle_existing_workspace_repo(
+                        &git_cfg,
+                        &repo_workspace_path,
+                        mirror_path.as_deref(),
+                    )
                 } else {
-                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, &mirror_path)
-                };
-
-                // Print result immediately and track failures
-                if !success {
-                    messages::error(&format!("{} (failed)", git_cfg.name));
-                    any_failed.store(true, Ordering::Relaxed);
-                }
-            });
-        }
-
-        pool.join();
-    }
-
-    any_failed.load(Ordering::Relaxed)
-}
-
-/// Update workspace repositories directly from remote URLs (no mirror)
-pub(crate) fn update_workspace_repos_no_mirror<T: config::SdkConfigCore>(
-    sdk_config: &T,
-    workspace_path: &Path,
-    is_init: bool,
-) {
-    let action = if is_init { "Initializing" } else { "Updating" };
-    messages::status(&format!(
-        "\n{} workspace repositories directly from remote URLs...",
-        action
-    ));
-
-    let tiers = match config::resolve_clone_order(sdk_config.gits()) {
-        Ok(t) => t,
-        Err(e) => {
-            messages::error(&format!("Dependency resolution failed: {}", e));
-            return;
-        }
-    };
-
-    for tier in &tiers {
-        let pool = ThreadPool::new(4);
-
-        for git_cfg in tier {
-            let git_cfg = git_cfg.clone();
-            let workspace_path = workspace_path.to_path_buf();
-
-            pool.execute(move || {
-                let repo_workspace_path = workspace_path.join(&git_cfg.name);
-
-                let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo_no_mirror(&git_cfg, &repo_workspace_path)
-                } else {
-                    clone_repo_to_workspace_no_mirror(&git_cfg, &repo_workspace_path)
-                };
-
-                // Print result immediately
-                if !success {
-                    messages::error(&format!("{} (failed)", git_cfg.name));
-                }
-            });
-        }
-
-        pool.join();
-    }
-}
-
-/// Update workspace repositories directly from remote URLs (no mirror), returns true if any failed
-pub(crate) fn update_workspace_repos_no_mirror_with_result<T: config::SdkConfigCore>(
-    sdk_config: &T,
-    workspace_path: &Path,
-    is_init: bool,
-) -> bool {
-    let action = if is_init { "Initializing" } else { "Updating" };
-    messages::status(&format!(
-        "\n{} workspace repositories directly from remote URLs...",
-        action
-    ));
-
-    let tiers = match config::resolve_clone_order(sdk_config.gits()) {
-        Ok(t) => t,
-        Err(e) => {
-            messages::error(&format!("Dependency resolution failed: {}", e));
-            return true;
-        }
-    };
-
-    let any_failed = Arc::new(AtomicBool::new(false));
-
-    for tier in &tiers {
-        let pool = ThreadPool::new(4);
-
-        for git_cfg in tier {
-            let git_cfg = git_cfg.clone();
-            let workspace_path = workspace_path.to_path_buf();
-            let any_failed = Arc::clone(&any_failed);
-
-            pool.execute(move || {
-                let repo_workspace_path = workspace_path.join(&git_cfg.name);
-
-                let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo_no_mirror(&git_cfg, &repo_workspace_path)
-                } else {
-                    clone_repo_to_workspace_no_mirror(&git_cfg, &repo_workspace_path)
+                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, mirror_path.as_deref())
                 };
 
                 // Print result immediately and track failures
@@ -777,36 +670,53 @@ pub(crate) fn update_workspace_repos_no_mirror_with_result<T: config::SdkConfigC
 pub(crate) fn handle_existing_workspace_repo(
     git_cfg: &config::GitConfig,
     repo_path: &Path,
-    mirror_path: &Path,
+    mirror_path: Option<&Path>,
 ) -> bool {
-    // Add mirror and set origin to upstream
-    let mirror_repo_path =
-        dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
-    let _ = git_operations::git_command(
-        &["remote", "set-url", "origin", &git_cfg.url],
-        Some(repo_path),
-    );
-    let _ = git_operations::git_command(
-        &[
-            "remote",
-            "add",
-            "mirror",
-            &format!("file://{}", mirror_repo_path.display()),
-        ],
-        Some(repo_path),
-    );
+    let refs = git_operations::ls_remote(&git_cfg.url, true, true).unwrap_or_default();
+    let (fetch_refspec, update_ref_name, sha) =
+        git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+    let target = sha.unwrap_or_else(|| git_cfg.commit.clone());
 
-    // Fetch from mirror first
-    let mirror_result = git_operations::git_command(&["fetch", "mirror"], Some(repo_path));
+    let success = if let Some(mirror_path) = mirror_path {
+        let mirror_repo_path =
+            dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
 
-    // Always fetch from origin as well (to get any missing objects)
-    let origin_result = git_operations::git_command(&["fetch", "origin"], Some(repo_path));
+        let _ = git_operations::git_command(
+            &["remote", "set-url", "origin", &git_cfg.url],
+            Some(repo_path),
+        );
+        let _ = git_operations::git_command(
+            &[
+                "remote",
+                "add",
+                "mirror",
+                &format!("file://{}", mirror_repo_path.display()),
+            ],
+            Some(repo_path),
+        );
 
-    let success = match (mirror_result, origin_result) {
-        (Ok(mirror_out), Ok(origin_out)) => mirror_out.success || origin_out.success,
-        (Ok(mirror_out), Err(_)) => mirror_out.success,
-        (Err(_), Ok(origin_out)) => origin_out.success,
-        _ => false,
+        if mirror_repo_path.exists() {
+            if !git_operations::cat_file(&mirror_repo_path, &target) {
+                let fetch_ok =
+                    git_operations::fetch_ref(&mirror_repo_path, "origin", &fetch_refspec, 1)
+                        .is_ok_and(|r| r.is_success());
+                if fetch_ok {
+                    let _ = git_operations::update_ref(
+                        &mirror_repo_path,
+                        &update_ref_name,
+                        "FETCH_HEAD",
+                    );
+                }
+            }
+            git_operations::fetch_ref(repo_path, "mirror", &fetch_refspec, 1)
+                .is_ok_and(|r| r.is_success())
+        } else {
+            git_operations::fetch_ref(repo_path, "origin", &fetch_refspec, 1)
+                .is_ok_and(|r| r.is_success())
+        }
+    } else {
+        git_operations::fetch_ref(repo_path, "origin", &fetch_refspec, 1)
+            .is_ok_and(|r| r.is_success())
     };
 
     if success {
@@ -814,69 +724,30 @@ pub(crate) fn handle_existing_workspace_repo(
         match dsdk_cli::git_manager::repo_has_pending_changes(repo_path) {
             Ok(false) => {
                 // Clean: safe to reset
-                // Check if the commit is a branch reference
-                if is_branch_reference(repo_path, &git_cfg.commit) {
-                    // For branches, get the latest commit and checkout that
-                    if let Some(latest_commit) =
-                        get_latest_commit_for_branch(repo_path, &git_cfg.commit)
-                    {
-                        let checkout_output = git_operations::checkout(repo_path, &latest_commit);
-                        match checkout_output {
-                            Ok(result) if result.is_success() => {
-                                messages::success(&format!(
-                                    "{} (updated {} to latest: {})",
-                                    git_cfg.name,
-                                    git_cfg.commit,
-                                    &latest_commit[..8]
-                                ));
-                                true
-                            }
-                            _ => {
-                                messages::error(&format!(
-                                    "{} (failed to checkout latest {})",
-                                    git_cfg.name, latest_commit
-                                ));
-                                false
-                            }
-                        }
-                    } else {
-                        // Fallback to original behavior if we can't get latest
-                        let checkout_result = git_operations::checkout(repo_path, &git_cfg.commit);
-                        match checkout_result {
-                            Ok(result) if result.is_success() => {
-                                messages::success(&format!(
-                                    "{} (updated to {})",
-                                    git_cfg.name, git_cfg.commit
-                                ));
-                                true
-                            }
-                            _ => {
-                                messages::error(&format!(
-                                    "{} (failed to checkout {})",
-                                    git_cfg.name, git_cfg.commit
-                                ));
-                                false
-                            }
-                        }
-                    }
-                } else {
-                    // For tags and specific commits, use the exact reference
-                    let checkout_result = git_operations::checkout(repo_path, &git_cfg.commit);
-                    match checkout_result {
-                        Ok(result) if result.is_success() => {
+                let checkout_output = git_operations::checkout(repo_path, &target);
+                match checkout_output {
+                    Ok(result) if result.is_success() => {
+                        if fetch_refspec.starts_with("refs/heads/") {
+                            messages::success(&format!(
+                                "{} (updated {} to latest: {})",
+                                git_cfg.name,
+                                git_cfg.commit,
+                                &target[..8]
+                            ));
+                        } else {
                             messages::success(&format!(
                                 "{} (pinned to {})",
                                 git_cfg.name, git_cfg.commit
                             ));
-                            true
                         }
-                        _ => {
-                            messages::error(&format!(
-                                "{} (failed to checkout {})",
-                                git_cfg.name, git_cfg.commit
-                            ));
-                            false
-                        }
+                        true
+                    }
+                    _ => {
+                        messages::error(&format!(
+                            "{} (failed to checkout {})",
+                            git_cfg.name, target
+                        ));
+                        false
                     }
                 }
             }
@@ -897,10 +768,7 @@ pub(crate) fn handle_existing_workspace_repo(
             }
         }
     } else {
-        messages::error(&format!(
-            "{} (failed to fetch from mirror and origin)",
-            git_cfg.name
-        ));
+        messages::error(&format!("{} (fetch failed)", git_cfg.name));
         false
     }
 }
@@ -909,7 +777,7 @@ pub(crate) fn handle_existing_workspace_repo(
 pub(crate) fn clone_repo_to_workspace(
     git_cfg: &config::GitConfig,
     repo_path: &Path,
-    mirror_path: &Path,
+    mirror_path: Option<&Path>,
 ) -> bool {
     // Remove directory if it exists but is not a git repo (e.g., created by
     // a parent repo clone in a previous tier)
@@ -925,366 +793,88 @@ pub(crate) fn clone_repo_to_workspace(
 
     messages::progress(&git_cfg.name, "cloning repository");
 
-    let mirror_repo_path =
-        dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
+    if let Some(mirror_path) = mirror_path {
+        let mirror_repo_path =
+            dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
 
-    // Determine the clone source (prefer mirror if exists, otherwise use original URL)
-    let clone_source = if mirror_repo_path.exists() {
-        format!("file://{}", mirror_repo_path.display())
-    } else {
-        git_cfg.url.clone()
-    };
+        if mirror_repo_path.exists() {
+            let refs = git_operations::ls_remote(&git_cfg.url, true, true).unwrap_or_default();
+            let (fetch_refspec, update_ref_name, sha) =
+                git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+            let target_sha = sha.unwrap_or_else(|| git_cfg.commit.clone());
 
-    let should_timeout = clone_source.starts_with("git@") || clone_source.starts_with("ssh://");
-
-    if mirror_repo_path.exists() {
-        // Use --reference to hardlink objects from the mirror
-        let result = git_operations::clone_repo(&clone_source, repo_path, Some(&mirror_repo_path));
-
-        match result {
-            Ok(result) if result.is_success() => {
-                // Set origin to upstream and add mirror remote
-                let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
-                let _ = git_operations::remote_add(
-                    repo_path,
-                    "mirror",
-                    &format!("file://{}", mirror_repo_path.display()),
-                );
-                return checkout_commit(git_cfg, repo_path);
+            // Ensure the commit is present in the mirror, fetching it if needed
+            if !git_operations::cat_file(&mirror_repo_path, &target_sha) {
+                let _ = git_operations::fetch_ref(&mirror_repo_path, "origin", &fetch_refspec, 1);
+                let _ =
+                    git_operations::update_ref(&mirror_repo_path, &update_ref_name, "FETCH_HEAD");
             }
-            _ => {
-                messages::error(&format!("{} (clone failed)", git_cfg.name));
-                return false;
-            }
-        }
-    } else if should_timeout {
-        // Use timeout for SSH URLs
-        if let Some(child) = execute_git_clone(
-            "git",
-            &["clone", &clone_source, &repo_path.to_string_lossy()],
-            git_cfg,
-        ) {
-            if let Ok(output) = child.wait_with_output() {
-                if output.status.success() {
-                    // Set origin to upstream
+
+            let mirror_url = format!("file://{}", mirror_repo_path.display());
+            let result = git_operations::clone_repo(&mirror_url, repo_path, &fetch_refspec, 1);
+            match result {
+                Ok(result) if result.is_success() => {
+                    // Set origin to upstream and add mirror remote
                     let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
+                    let _ = git_operations::remote_add(
+                        repo_path,
+                        "mirror",
+                        &format!("file://{}", mirror_repo_path.display()),
+                    );
                     return checkout_commit(git_cfg, repo_path);
-                } else {
+                }
+                _ => {
                     messages::error(&format!("{} (clone failed)", git_cfg.name));
                     return false;
                 }
             }
-        } else {
-            messages::error(&format!("{} (clone timed out)", git_cfg.name));
-            return false;
-        }
-    } else {
-        // Direct execution for HTTP/HTTPS/file URLs
-        let result = git_operations::clone_repo(&clone_source, repo_path, None);
-
-        match result {
-            Ok(result) if result.is_success() => {
-                // Set origin to upstream
-                let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
-                return checkout_commit(git_cfg, repo_path);
-            }
-            _ => {
-                messages::error(&format!("{} (clone failed)", git_cfg.name));
-                return false;
-            }
         }
     }
-    false
+
+    // Direct clone (no mirror, or mirror path not yet on disk)
+    let refs = git_operations::ls_remote(&git_cfg.url, true, true).unwrap_or_default();
+    let (fetch_refspec, _, _) = git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+    let result = git_operations::clone_repo(&git_cfg.url, repo_path, &fetch_refspec, 1);
+    match result {
+        Ok(result) if result.is_success() => checkout_commit(git_cfg, repo_path),
+        _ => {
+            messages::error(&format!("{} (clone failed)", git_cfg.name));
+            false
+        }
+    }
 }
 
 /// Checkout the specified commit for a repository
 pub(crate) fn checkout_commit(git_cfg: &config::GitConfig, repo_path: &Path) -> bool {
-    // Check if the commit is a branch reference
-    if is_branch_reference(repo_path, &git_cfg.commit) {
-        // For branches, get the latest commit and checkout that
-        if let Some(latest_commit) = get_latest_commit_for_branch(repo_path, &git_cfg.commit) {
-            let output = git_operations::checkout(repo_path, &latest_commit);
-
-            match output {
-                Ok(result) if result.is_success() => {
-                    messages::success(&format!(
-                        "{} (cloned and checked out {} to latest: {})",
-                        git_cfg.name,
-                        git_cfg.commit,
-                        &latest_commit[..8]
-                    ));
-                    true
-                }
-                _ => {
-                    messages::error(&format!(
-                        "{} (cloned, but failed to checkout latest {})",
-                        git_cfg.name, latest_commit
-                    ));
-                    false
-                }
-            }
-        } else {
-            // Fallback to original behavior
-            let output = git_operations::checkout(repo_path, &git_cfg.commit);
-
-            match output {
-                Ok(result) if result.is_success() => {
-                    messages::success(&format!(
-                        "{} (cloned and checked out to {})",
-                        git_cfg.name, git_cfg.commit
-                    ));
-                    true
-                }
-                _ => {
-                    messages::error(&format!(
-                        "{} (cloned, but failed to checkout to {})",
-                        git_cfg.name, git_cfg.commit
-                    ));
-                    false
-                }
-            }
-        }
-    } else {
-        // For tags and specific commits, use the exact reference
-        let output = git_operations::checkout(repo_path, &git_cfg.commit);
-
-        match output {
-            Ok(result) if result.is_success() => {
+    let refs = git_operations::ls_remote(&git_cfg.url, true, true).unwrap_or_default();
+    let (fetch_refspec, _, sha) = git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+    let target = sha.unwrap_or_else(|| git_cfg.commit.clone());
+    let output = git_operations::checkout(repo_path, &target);
+    match output {
+        Ok(result) if result.is_success() => {
+            if fetch_refspec.starts_with("refs/heads/") {
+                messages::success(&format!(
+                    "{} (cloned and checked out {} to latest: {})",
+                    git_cfg.name,
+                    git_cfg.commit,
+                    &target[..8]
+                ));
+            } else {
                 messages::success(&format!(
                     "{} (cloned and pinned to {})",
                     git_cfg.name, git_cfg.commit
                 ));
-                true
             }
-            _ => {
-                messages::error(&format!(
-                    "{} (cloned, but failed to checkout to {})",
-                    git_cfg.name, git_cfg.commit
-                ));
-                false
-            }
+            true
         }
-    }
-}
-
-/// Execute a git clone command and wait for completion
-pub(crate) fn execute_git_clone(
-    command: &str,
-    args: &[&str],
-    git_cfg: &config::GitConfig,
-) -> Option<Child> {
-    let start = Instant::now();
-    let mut child = match Command::new(command)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
+        _ => {
             messages::error(&format!(
-                "Failed to start git clone for {}: {}",
-                git_cfg.name, e
+                "{} (cloned, but failed to checkout to {})",
+                git_cfg.name, target
             ));
-            return None;
-        }
-    };
-
-    // Provide periodic updates for long-running operations
-    let mut last_update = start;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                messages::status(&format!(
-                    "Git clone for {} completed in {:.1}s",
-                    git_cfg.name,
-                    start.elapsed().as_secs_f64()
-                ));
-                return Some(child);
-            }
-            Ok(None) => {
-                // Provide periodic updates for long-running operations
-                if last_update.elapsed() > Duration::from_secs(30) {
-                    messages::status(&format!(
-                        "Still cloning {} (elapsed: {:.1}s)...",
-                        git_cfg.name,
-                        start.elapsed().as_secs_f64()
-                    ));
-                    last_update = Instant::now();
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
-            Err(e) => {
-                messages::error(&format!(
-                    "Error waiting for git clone for {}: {}",
-                    git_cfg.name, e
-                ));
-                return None;
-            }
+            false
         }
     }
-}
-
-/// Handle an existing repository in the workspace (no mirror mode)
-pub(crate) fn handle_existing_workspace_repo_no_mirror(
-    git_cfg: &config::GitConfig,
-    repo_path: &Path,
-) -> bool {
-    // Fetch directly from origin
-    let origin_result = git_operations::fetch(repo_path, Some("origin"));
-
-    let success = match origin_result {
-        Ok(result) => result.is_success(),
-        Err(_) => false,
-    };
-
-    if success {
-        // Only reset if repo is clean
-        match dsdk_cli::git_manager::repo_has_pending_changes(repo_path) {
-            Ok(false) => {
-                // Clean: safe to reset
-                // Check if the commit is a branch reference
-                if is_branch_reference(repo_path, &git_cfg.commit) {
-                    // For branches, get the latest commit and checkout that
-                    if let Some(latest_commit) =
-                        get_latest_commit_for_branch(repo_path, &git_cfg.commit)
-                    {
-                        let checkout_output = git_operations::checkout(repo_path, &latest_commit);
-                        match checkout_output {
-                            Ok(result) if result.is_success() => {
-                                messages::success(&format!(
-                                    "{} (updated {} to latest: {})",
-                                    git_cfg.name,
-                                    git_cfg.commit,
-                                    &latest_commit[..8]
-                                ));
-                                true
-                            }
-                            _ => {
-                                messages::error(&format!(
-                                    "{} (failed to checkout latest {})",
-                                    git_cfg.name, latest_commit
-                                ));
-                                false
-                            }
-                        }
-                    } else {
-                        // Fallback to original behavior if we can't get latest
-                        let checkout_output = git_operations::checkout(repo_path, &git_cfg.commit);
-                        match checkout_output {
-                            Ok(result) if result.is_success() => {
-                                messages::success(&format!(
-                                    "{} (updated to {})",
-                                    git_cfg.name, git_cfg.commit
-                                ));
-                                true
-                            }
-                            _ => {
-                                messages::error(&format!(
-                                    "{} (failed to checkout {})",
-                                    git_cfg.name, git_cfg.commit
-                                ));
-                                false
-                            }
-                        }
-                    }
-                } else {
-                    // For tags and specific commits, use the exact reference
-                    let checkout_result = git_operations::checkout(repo_path, &git_cfg.commit);
-                    match checkout_result {
-                        Ok(result) if result.is_success() => {
-                            messages::success(&format!(
-                                "{} (pinned to {})",
-                                git_cfg.name, git_cfg.commit
-                            ));
-                            true
-                        }
-                        _ => {
-                            messages::error(&format!(
-                                "{} (failed to checkout {})",
-                                git_cfg.name, git_cfg.commit
-                            ));
-                            false
-                        }
-                    }
-                }
-            }
-            Ok(true) => {
-                // Dirty: do nothing
-                messages::info(&format!(
-                    "! {} has pending changes, not resetting to {}",
-                    git_cfg.name, git_cfg.commit
-                ));
-                true
-            }
-            Err(e) => {
-                messages::error(&format!(
-                    "Error checking repo status for {}: {}",
-                    git_cfg.name, e
-                ));
-                false
-            }
-        }
-    } else {
-        messages::error(&format!("{} (fetch failed)", git_cfg.name));
-        false
-    }
-}
-
-/// Clone a repository to the workspace (no mirror mode)
-pub(crate) fn clone_repo_to_workspace_no_mirror(
-    git_cfg: &config::GitConfig,
-    repo_path: &Path,
-) -> bool {
-    // Remove directory if it exists but is not a git repo (e.g., created by
-    // a parent repo clone in a previous tier)
-    if repo_path.exists() && !repo_path.join(".git").is_dir() {
-        if let Err(e) = std::fs::remove_dir_all(repo_path) {
-            messages::error(&format!(
-                "{} (failed to remove non-git directory: {})",
-                git_cfg.name, e
-            ));
-            return false;
-        }
-    }
-
-    let should_timeout = git_cfg.url.starts_with("git@") || git_cfg.url.starts_with("ssh://");
-
-    if should_timeout {
-        // Use timeout for SSH URLs
-        if let Some(child) = execute_git_clone(
-            "git",
-            &["clone", &git_cfg.url, &repo_path.to_string_lossy()],
-            git_cfg,
-        ) {
-            if let Ok(output) = child.wait_with_output() {
-                if output.status.success() {
-                    return checkout_commit(git_cfg, repo_path);
-                } else {
-                    messages::error(&format!("{} (clone failed)", git_cfg.name));
-                    return false;
-                }
-            }
-        } else {
-            messages::error(&format!("{} (clone timed out)", git_cfg.name));
-            return false;
-        }
-    } else {
-        // Direct execution for HTTP/HTTPS/file URLs
-        let result = git_operations::clone_repo(&git_cfg.url, repo_path, None);
-
-        match result {
-            Ok(result) if result.is_success() => {
-                return checkout_commit(git_cfg, repo_path);
-            }
-            _ => {
-                messages::error(&format!("{} (clone failed)", git_cfg.name));
-                return false;
-            }
-        }
-    }
-    false
 }
 
 /// Handle Docker commands
